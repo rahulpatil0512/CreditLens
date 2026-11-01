@@ -1,0 +1,176 @@
+# =============================================================================
+# Credit Decision & Risk Intelligence System - Central Configuration
+# =============================================================================
+# All non-secret, tunable parameters live here. Secrets (API keys) live in .env.
+# Every assumption that is NOT derived from real data is flagged in comments and
+# surfaced at runtime in the audit trail.
+# =============================================================================
+
+project:
+  name: "credit-risk-intelligence"
+  # Bumped whenever the trained model artifact changes. Written into every
+  # audit record so a decision can always be traced to the exact model.
+  model_version: "0.1.0"
+  random_seed: 42
+
+paths:
+  raw_data: "data/raw/application_train.csv"   # real Home Credit file (user-supplied)
+  processed_dir: "data/processed"
+  artifacts_dir: "artifacts"
+  audit_db: "artifacts/audit.sqlite"
+  calibration_plot: "artifacts/calibration_curve.png"
+  vector_store_dir: "artifacts/vector_store"
+  policy_docs_dir: "docs/policy"
+
+data:
+  # If the real raw_data file is missing, fall back to a synthetic dataset that
+  # mimics the Home Credit schema so the full pipeline is runnable offline.
+  allow_synthetic_fallback: true
+  synthetic_n_rows: 30000
+  target_column: "TARGET"           # 1 = default (payment difficulty), 0 = repaid
+  id_column: "SK_ID_CURR"
+  test_size: 0.20
+  calibration_size: 0.15            # carved out of the training portion for PD calibration
+  # Attributes removed from the MODEL INPUTS for fairness/legal reasons, but
+  # RETAINED separately for the post-hoc disparity audit (never used to decide).
+  protected_attributes:
+    - "CODE_GENDER"
+
+# Features the model is allowed to use. Kept deliberately small and
+# interpretable (main application table only). External sources are the
+# strongest predictors in Home Credit and are included, but they are NOT
+# actionable (see counterfactual.actionable_features).
+features:
+  numeric:
+    - "AMT_INCOME_TOTAL"
+    - "AMT_CREDIT"
+    - "AMT_ANNUITY"
+    - "AMT_GOODS_PRICE"
+    - "AGE_YEARS"                   # engineered from DAYS_BIRTH
+    - "YEARS_EMPLOYED"              # engineered from DAYS_EMPLOYED (anomaly-cleaned)
+    - "EXT_SOURCE_1"
+    - "EXT_SOURCE_2"
+    - "EXT_SOURCE_3"
+    - "CREDIT_INCOME_RATIO"         # engineered: AMT_CREDIT / AMT_INCOME_TOTAL
+    - "ANNUITY_INCOME_RATIO"        # engineered: AMT_ANNUITY / AMT_INCOME_TOTAL
+    - "CREDIT_TERM"                 # engineered: AMT_CREDIT / AMT_ANNUITY (approx months)
+    - "CNT_CHILDREN"
+    - "CNT_FAM_MEMBERS"
+  categorical:
+    - "NAME_CONTRACT_TYPE"
+    - "NAME_EDUCATION_TYPE"
+    - "NAME_FAMILY_STATUS"
+    - "NAME_INCOME_TYPE"
+    - "NAME_HOUSING_TYPE"
+
+model:
+  # Primary model. Logistic Regression is always trained as a baseline.
+  primary: "lightgbm"               # one of: lightgbm, logistic_regression
+  calibration_method: "isotonic"    # isotonic | sigmoid  (maps raw score -> true PD)
+  lightgbm:
+    n_estimators: 400
+    learning_rate: 0.03
+    num_leaves: 31
+    max_depth: -1
+    min_child_samples: 100
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_lambda: 1.0
+    class_weight: "balanced"
+    n_jobs: -1
+  logistic_regression:
+    C: 1.0
+    max_iter: 2000
+    class_weight: "balanced"
+  # Optional, documented but off by default: monotonic constraints
+  # (e.g. higher EXT_SOURCE -> never higher PD). See README.
+  monotonic_constraints_enabled: false
+
+# -----------------------------------------------------------------------------
+# Risk engine. ALL of the LGD/EAD figures below are ASSUMPTIONS, not estimated
+# from data (Home Credit ships no recovery/exposure outcomes). They are clearly
+# labelled as assumptions everywhere they are used.
+# -----------------------------------------------------------------------------
+risk:
+  # Loss Given Default: fraction of exposure lost if the borrower defaults.
+  # 0.45 is a commonly cited unsecured-retail benchmark (Basel Foundation-IRB
+  # style). ASSUMPTION ONLY - not derived from this dataset.
+  lgd_assumption: 0.45
+  # Exposure at Default proxy. We assume EAD ~= AMT_CREDIT (full drawn balance).
+  # ASSUMPTION ONLY.
+  ead_source: "AMT_CREDIT"
+  # Annual interest margin used only to derive the break-even decision cutoff.
+  # ASSUMPTION ONLY.
+  annual_margin_assumption: 0.08
+
+# Decision policy: PD -> Approve / Review / Reject.
+# Thresholds are derived from a cost/break-even argument (see risk/engine.py),
+# then widened by a review buffer. Fixed overrides can pin them if desired.
+decision:
+  mode: "cost_based"                # cost_based | fixed
+  review_buffer: 0.03               # +/- band around break-even PD -> "Review"
+  fixed:
+    approve_below: 0.08
+    reject_above: 0.20
+
+# -----------------------------------------------------------------------------
+# Counterfactuals: only these features may be changed when searching for a
+# realistic way to flip a Reject. Everything else (age, external scores,
+# protected attributes) is frozen. direction constrains the search:
+#   "decrease" -> only lowering the value is considered, etc.
+# -----------------------------------------------------------------------------
+counterfactual:
+  # Only independent BASE levers are listed. Derived features (CREDIT_TERM,
+  # CREDIT_INCOME_RATIO, ANNUITY_INCOME_RATIO) are RECOMPUTED after each change,
+  # never set directly. Lowering AMT_ANNUITY is the economic equivalent of
+  # extending the loan term (it raises the derived CREDIT_TERM).
+  actionable_features:
+    AMT_CREDIT:        { direction: "decrease", min_factor: 0.50, step_factor: 0.05 }
+    AMT_ANNUITY:       { direction: "decrease", min_factor: 0.50, step_factor: 0.05 }
+    AMT_GOODS_PRICE:   { direction: "decrease", min_factor: 0.50, step_factor: 0.05 }
+  max_features_changed: 2           # prefer simple, explainable changes
+  target_decision: "Approve"       # what the counterfactual tries to reach
+
+# Scenario sensitivity analysis (NOT regulatory macro stress testing - see README).
+# Each scenario applies simple shocks to input features and recomputes PD / EL.
+stress:
+  scenarios:
+    income_drop_20:
+      description: "Borrower income falls 20%"
+      shocks: { AMT_INCOME_TOTAL: { multiply: 0.80 } }
+    income_drop_40:
+      description: "Borrower income falls 40% (severe)"
+      shocks: { AMT_INCOME_TOTAL: { multiply: 0.60 } }
+    unemployment_shock:
+      description: "Job loss: employment reset and income down 50%"
+      shocks:
+        AMT_INCOME_TOTAL: { multiply: 0.50 }
+        YEARS_EMPLOYED:   { set: 0 }
+    rate_hike:
+      description: "Interest-rate rise raises annuity burden 15%"
+      shocks: { AMT_ANNUITY: { multiply: 1.15 } }
+
+rag:
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"   # downloaded once
+  # If true, use the semantic model when available; otherwise fall back to the
+  # zero-download lexical embedder. Set false to force offline lexical mode.
+  prefer_semantic: true
+  collection_name: "credit_policy"
+  chunk_size: 900                   # characters
+  chunk_overlap: 150
+  top_k: 4
+
+api:
+  # CORS origins allowed to call the API. "*" is convenient for local dev with
+  # a Lovable frontend; restrict to your deployed frontend origin in production.
+  cors_origins: ["*"]
+  title: "Credit Decision & Risk Intelligence API"
+
+llm:
+  # The LLM only phrases already-computed results. It never produces PD,
+  # calculations, decisions or regulatory claims. Fully optional.
+  enabled: true                     # if false OR no key present -> template fallback
+  provider: "anthropic"             # anthropic | openai | gemini | ollama
+  model: "claude-opus-5-5"
+  max_tokens: 4000
+  temperature: 0.2                  # used by openai/gemini/ollama only; Claude models reject it
